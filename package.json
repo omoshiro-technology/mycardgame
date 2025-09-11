@@ -1,0 +1,28 @@
+{
+  "name": "mycardgame",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "tsx scripts/generate-card.ts",
+    "generate:auto": "tsx scripts/generate-card.ts --auto",
+    "rules:generate": "tsx scripts/generate-rulebook.ts",
+    "play": "tsx play.ts decks/starter-aggro.json decks/starter-control.json",
+    "verify:engine": "tsx scripts/verify-engine-coverage.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test:engine": "tsx scripts/run-engine-tests.ts",
+    "test:engine:stubs": "tsx scripts/generate-engine-test-stubs.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^2.0.15",
+    "@ai-sdk/google": "^2.0.13",
+    "@ai-sdk/openai": "^2.0.28",
+    "ai": "^5.0.40",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "tsx": "^4.16.2",
+    "typescript": "^5.6.2"
+  }
+}
