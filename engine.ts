@@ -1,7 +1,7 @@
 // Minimal game engine to play with CORE_RULES and Card schema
 // Scope: implements enough to play matches with Units and simple Spells.
 // Supported effects: DealDamage, Heal, Draw, Move, NoOp
-// Unsupported (ignored for now): triggers, replacements, continuous effects, colors
+// Unsupported (ignored for now): complex target choices, advanced stacking
 
 import { CORE_RULES, type GameRules } from './core-rules.ts';
 import { analyzeRules } from './rules-verifier.ts';
@@ -31,6 +31,7 @@ type RuntimeCard = {
   turnEntered?: number;
   isToken?: boolean;
   // Runtime state extensions
+  tapped?: boolean; // tapped state for permanents (units/artifacts/enchantments)
   counters?: Record<string, number>;
   // Temporary/permanent stat modifications
   bonusAtkPerm?: number;
@@ -50,6 +51,8 @@ export type PlayerState = {
   name: string;
   life: number;
   ap: number; // action points (generic resource)
+  // Optional color pool for colored cost payment when enabled by rules
+  colorPool?: Record<string, number>;
   library: string[]; // card ids (top is end of array)
   hand: string[];
   battlefield: string[];
@@ -149,6 +152,8 @@ function moveCard(s: GameState, cardId: string, toZone: PlayerZone) {
   rc.zone = dest;
   // Fire OnEnter when a card enters BF
   if (dest === 'BF') {
+    // entering battlefield: comes in untapped by default
+    rc.tapped = false;
     fireTriggers(s, 'OnEnter', { subjectId: cardId });
     fireTriggers(s, 'OnNameMatched', { subjectId: cardId });
   }
@@ -191,6 +196,10 @@ function isLegalTarget(s: GameState, controller: PlayerIndex, sel: Selector, id:
   if (!zones.includes(rc.zone)) return false;
   // predicate filter
   if (sel.filter && !matchesPredicate(s, controller, selfId, id, sel.filter)) return false;
+  // keyword-based targeting restrictions
+  const hasKeyword = (k: string) => !!rc.card.keywords?.includes(k);
+  // Hexproof: cannot be targeted by opponent's spells/abilities
+  if (hasKeyword('Hexproof') && rc.owner !== controller) return false;
   return true;
 }
 
@@ -240,8 +249,8 @@ export function initGame(deckA: LoadedDeck, deckB: LoadedDeck, seed = 42): GameS
   };
 
   const cards = new Map<string, RuntimeCard>();
-  const p0: PlayerState = { idx: 0, name: deckA.name || 'P1', life: rules.build.startingLife, ap: 0, library: [], hand: [], battlefield: [], graveyard: [], exile: [], mulligansTaken: 0 };
-  const p1: PlayerState = { idx: 1, name: deckB.name || 'P2', life: rules.build.startingLife, ap: 0, library: [], hand: [], battlefield: [], graveyard: [], exile: [], mulligansTaken: 0 };
+  const p0: PlayerState = { idx: 0, name: deckA.name || 'P1', life: rules.build.startingLife, ap: 0, colorPool: {}, library: [], hand: [], battlefield: [], graveyard: [], exile: [], mulligansTaken: 0 };
+  const p1: PlayerState = { idx: 1, name: deckB.name || 'P2', life: rules.build.startingLife, ap: 0, colorPool: {}, library: [], hand: [], battlefield: [], graveyard: [], exile: [], mulligansTaken: 0 };
 
   for (const rc of deckA.list) { cards.set(rc.id, rc); p0.library.push(rc.id); }
   for (const rc of deckB.list) { cards.set(rc.id, rc); p1.library.push(rc.id); }
@@ -361,7 +370,9 @@ type Operation =
   | { kind: 'IncReplacementUsage'; key: string; per: 'TURN' | 'GAME' }
   | { kind: 'IncEvent'; event: 'UnitDied'|'TokenCreated'|'SpellCast'; who: PlayerIndex }
   | { kind: 'SpendAP'; pid: PlayerIndex; amount: number }
+  | { kind: 'SpendColors'; pid: PlayerIndex; colors: Record<string, number> }
   | { kind: 'SetTurnEntered'; id: string; turn: number }
+  | { kind: 'SetTapped'; id: string; tapped: boolean }
   | { kind: 'DamagePlayer'; pid: PlayerIndex; amount: number; sourceId?: string }
   | { kind: 'CheckPlayers' };
 
@@ -654,6 +665,11 @@ function applyOperation(s: GameState, op: Operation) {
       const p = s.players[s.turn.active];
       s.turn.phase = 'UPKEEP';
       pushLog(s, `-- Turn ${s.turn.number} start: ${p.name} --`);
+      // Untap all permanents of the active player at the start of their turn
+      for (const id of p.battlefield) {
+        const rc = s.cards.get(id);
+        if (rc) rc.tapped = false;
+      }
       // reset per-turn counters
       s.eventsTurn.clear();
       s.triggerUseTurn.clear();
@@ -731,11 +747,28 @@ function applyOperation(s: GameState, op: Operation) {
     }
     case 'IncEvent': { incEvent(s, op.event, op.who); return; }
     case 'SpendAP': { s.players[op.pid].ap -= op.amount; if (s.players[op.pid].ap < 0) s.players[op.pid].ap = 0; return; }
+    case 'SpendColors': {
+      const pool = (s.players[op.pid].colorPool = s.players[op.pid].colorPool || {});
+      for (const [c, n] of Object.entries(op.colors)) {
+        pool[c] = Math.max(0, (pool[c] || 0) - n);
+      }
+      return;
+    }
     case 'SetTurnEntered': { const rc = s.cards.get(op.id); if (rc) rc.turnEntered = op.turn; return; }
+    case 'SetTapped': { const rc = s.cards.get(op.id); if (rc) rc.tapped = op.tapped; return; }
     case 'DamagePlayer': {
       const opp = s.players[op.pid];
       opp.life -= op.amount;
       pushLog(s, `${opp.name} takes ${op.amount} damage. (life ${opp.life})`);
+      // Lifelink: if source has lifelink, its controller gains life equal to damage dealt
+      if (op.sourceId) {
+        const src = s.cards.get(op.sourceId);
+        if (src && src.card.keywords?.includes('Lifelink')) {
+          const ctrl = s.players[src.owner];
+          ctrl.life += op.amount;
+          pushLog(s, `${ctrl.name} gains ${op.amount} life (Lifelink). (life ${ctrl.life})`);
+        }
+      }
       // Triggers
       fireTriggers(s, 'OnDamageDealt', { subjectPlayer: op.pid, sourceId: op.sourceId });
       checkPlayerDeath(s);
@@ -894,11 +927,34 @@ function dealDamageToPermanent(s: GameState, id: string, n: number, sourceId?: s
   const stats = getEffectiveBaseStats(s, rc);
   const hpMax = stats.hp + (rc.bonusHpPerm || 0) + (rc.bonusHpEOT || 0);
   pushLog(s, `${rc.card.name} takes ${n} damage (HP ${Math.max(0, hpMax - rc.damage)}).`);
+  // Lifelink to controller of source (if any)
+  if (sourceId) {
+    const src = s.cards.get(sourceId);
+    if (src && src.card.keywords?.includes('Lifelink')) {
+      const ctrl = s.players[src.owner];
+      ctrl.life += dmg;
+      pushLog(s, `${ctrl.name} gains ${dmg} life (Lifelink). (life ${ctrl.life})`);
+    }
+  }
+  // Deathtouch: any damage from a source with Deathtouch destroys the unit (unless indestructible)
+  if (sourceId) {
+    const src = s.cards.get(sourceId);
+    const targetIndestructible = !!rc.card.keywords?.includes('Indestructible');
+    if (src && src.card.keywords?.includes('Deathtouch') && !targetIndestructible) {
+      destroyPermanent(s, id);
+      return;
+    }
+  }
   // Triggers: damage dealt
   fireTriggers(s, 'OnDamageDealt', { subjectId: id, sourceId });
   // lethal check
   if ((hpMax - rc.damage) <= s.rules.damage.lethalAt) {
-    destroyPermanent(s, id);
+    // Indestructible survives lethal damage
+    if (rc.card.keywords?.includes('Indestructible')) {
+      pushLog(s, `${rc.card.name} is indestructible and survives lethal damage.`);
+    } else {
+      destroyPermanent(s, id);
+    }
   }
 }
 
@@ -930,7 +986,11 @@ function checkLethalAfterStatChange(s: GameState, id: string) {
   const stats = getEffectiveBaseStats(s, rc);
   const hpMax = stats.hp + (rc.bonusHpPerm || 0) + (rc.bonusHpEOT || 0);
   if ((hpMax - rc.damage) <= s.rules.damage.lethalAt) {
-    destroyPermanent(s, id);
+    if (rc.card.keywords?.includes('Indestructible')) {
+      pushLog(s, `${rc.card.name} is indestructible and survives lethal change.`);
+    } else {
+      destroyPermanent(s, id);
+    }
   }
 }
 
@@ -973,6 +1033,9 @@ export function canCastFromHand(s: GameState, pid: PlayerIndex, handIndex: numbe
   // Apply continuous cost modifiers
   cost = Math.max(0, applyCostModifiers(s, pid, rc.id, cost));
   if (p.ap < cost) return { ok: false, reason: 'Not enough AP' };
+  // Color payment (optional)
+  const colorCheck = canPayColoredCost(s, pid, rc.card.cost.colors || []);
+  if (!colorCheck.ok) return colorCheck;
   return { ok: true };
 }
 
@@ -984,10 +1047,15 @@ export function castFromHand(s: GameState, pid: PlayerIndex, handIndex: number, 
   let cost = rc.card.cost.generic || 0;
   cost = Math.max(0, applyCostModifiers(s, pid, id, cost));
   if (p.ap < cost) return { ok: false, reason: 'Not enough AP' };
+  const colorCheck = canPayColoredCost(s, pid, rc.card.cost.colors || []);
+  if (!colorCheck.ok) return colorCheck;
   // Plan operations for cast
   const newAp = p.ap - cost;
   const ops: Operation[] = [];
   ops.push({ kind: 'SpendAP', pid, amount: cost });
+  if (Object.keys(colorCheck.toSpend || {}).length > 0) {
+    ops.push({ kind: 'SpendColors', pid, colors: colorCheck.toSpend! });
+  }
   ops.push({ kind: 'Log', msg: `${p.name} casts ${rc.card.name} (cost ${cost}, AP ${newAp}).` });
   ops.push({ kind: 'IncEvent', event: 'SpellCast', who: pid });
   ops.push({ kind: 'FireTriggers', when: 'OnCast', ctx: { subjectId: id } });
@@ -1015,7 +1083,11 @@ export function canAttack(s: GameState, pid: PlayerIndex, bfIndex: number): { ok
   if (bfIndex < 0 || bfIndex >= units.length) return { ok: false, reason: 'Invalid unit index' };
   const rc = units[bfIndex];
   if (!rc.card.stats) return { ok: false, reason: 'Not a unit' };
-  if (s.rules.combat.summoningSickness && rc.turnEntered === s.turn.number) return { ok: false, reason: 'Summoning sickness' };
+  if (rc.tapped) return { ok: false, reason: 'Tapped' };
+  const hasHaste = !!rc.card.keywords?.includes('Haste');
+  const isSummoningSick = s.rules.combat.summoningSickness && rc.turnEntered === s.turn.number && !hasHaste;
+  if (isSummoningSick) return { ok: false, reason: 'Summoning sickness' };
+  if (rc.card.keywords?.includes('Defender')) return { ok: false, reason: 'Defender (can\'t attack)' };
   return { ok: true };
 }
 
@@ -1030,6 +1102,9 @@ export function attack(s: GameState, pid: PlayerIndex, bfIndex: number, target: 
   if (s.rules.combat.attackerTargets === 'PlayerOnly' && target.kind !== 'Player') return { ok: false, reason: 'Must attack player' };
   if (s.rules.combat.attackerTargets === 'UnitOnly' && target.kind !== 'Unit') return { ok: false, reason: 'Must attack unit' };
   const ops: Operation[] = [];
+  // Tap to attack unless Vigilance
+  const vigilant = !!attacker.card.keywords?.includes('Vigilance');
+  if (!vigilant) ops.push({ kind: 'SetTapped', id: attacker.id, tapped: true });
   ops.push({ kind: 'FireTriggers', when: 'OnAttack', ctx: { subjectId: attacker.id } });
   const aStats = getEffectiveBaseStats(s, attacker);
   const dmg = aStats.atk + (attacker.bonusAtkPerm || 0) + (attacker.bonusAtkEOT || 0);
@@ -1243,6 +1318,36 @@ function applyCostModifiers(s: GameState, controller: PlayerIndex, cardId: strin
     }
   }
   return cost;
+}
+
+// Colored cost payment (optional): when resources.payment is GenericAndColors and policy is InGamePayment,
+// enforce that the player has sufficient colorPool to pay for cost.colors.
+function tallyColors(colors: string[]): Record<string, number> {
+  const need: Record<string, number> = {};
+  for (const c of colors) need[c] = (need[c] || 0) + 1;
+  return need;
+}
+
+function canPayColoredCost(
+  s: GameState,
+  pid: PlayerIndex,
+  colors: string[],
+): { ok: true; toSpend: Record<string, number> } | { ok: false; reason: string } {
+  if (colors.length === 0) return { ok: true, toSpend: {} };
+  const res = s.rules.resources;
+  if (res.payment !== 'GenericAndColors') return { ok: true, toSpend: {} };
+  if (res.colors.policy !== 'InGamePayment') {
+    // Color membership only; do not enforce at runtime
+    return { ok: true, toSpend: {} };
+  }
+  const need = tallyColors(colors);
+  const pool = s.players[pid].colorPool || {};
+  const lacking: string[] = [];
+  for (const [c, n] of Object.entries(need)) {
+    if ((pool[c] || 0) < n) lacking.push(`${c}x${n}`);
+  }
+  if (lacking.length > 0) return { ok: false, reason: `Not enough colors (${lacking.join(', ')})` };
+  return { ok: true, toSpend: need };
 }
 
 function resolveStack(s: GameState) {
